@@ -1,0 +1,223 @@
+# ============================================================
+# Advanced Time Series Forecasting with Attention Transformers
+# ============================================================
+
+# -----------------------
+# 1. Imports & Settings
+# -----------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(42)
+np.random.seed(42)
+
+# -----------------------
+# 2. Data Generation
+# -----------------------
+def generate_multivariate_ts(n_points=2500):
+    t = np.arange(n_points)
+
+    trend = 0.005 * t
+    seasonal_1 = np.sin(2 * np.pi * t / 50)
+    seasonal_2 = np.cos(2 * np.pi * t / 30)
+
+    x1 = trend + seasonal_1 + np.random.normal(0, 0.2, n_points)
+    x2 = 0.7 * x1 + seasonal_2 + np.random.normal(0, 0.1, n_points)
+    x3 = 0.5 * x1 + 0.3 * x2 + np.random.normal(0, 0.1, n_points)
+    x4 = np.cos(2 * np.pi * t / 80) + trend + np.random.normal(0, 0.15, n_points)
+    x5 = x3 - x2 + np.random.normal(0, 0.1, n_points)
+
+    return np.vstack([x1, x2, x3, x4, x5]).T
+
+
+data = generate_multivariate_ts()
+df = pd.DataFrame(data, columns=[f"feature_{i}" for i in range(1, 6)])
+
+# -----------------------
+# 3. Preprocessing
+# -----------------------
+LOOKBACK = 30
+HORIZON = 1
+
+scaler = StandardScaler()
+data_scaled = scaler.fit_transform(data)
+
+
+def create_sequences(data, lookback, horizon):
+    X, y = [], []
+    for i in range(len(data) - lookback - horizon):
+        X.append(data[i:i+lookback])
+        y.append(data[i+lookback:i+lookback+horizon, 0])
+    return np.array(X), np.array(y)
+
+
+X, y = create_sequences(data_scaled, LOOKBACK, HORIZON)
+
+split = int(0.8 * len(X))
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+
+train_ds = TensorDataset(
+    torch.tensor(X_train, dtype=torch.float32),
+    torch.tensor(y_train, dtype=torch.float32)
+)
+
+test_ds = TensorDataset(
+    torch.tensor(X_test, dtype=torch.float32),
+    torch.tensor(y_test, dtype=torch.float32)
+)
+
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_ds, batch_size=64)
+
+# -----------------------
+# 4. Positional Encoding
+# -----------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.pe = pe.unsqueeze(0)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)].to(x.device)
+
+# -----------------------
+# 5. Transformer Model
+# -----------------------
+class TimeSeriesTransformer(nn.Module):
+    def __init__(self, n_features, d_model=64, heads=4, layers=2):
+        super().__init__()
+
+        self.embedding = nn.Linear(n_features, d_model)
+        self.positional = PositionalEncoding(d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=heads,
+            batch_first=True
+        )
+
+        self.encoder = nn.TransformerEncoder(encoder_layer, layers)
+        self.fc = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.positional(x)
+        enc_out = self.encoder(x)
+        return self.fc(enc_out[:, -1, :])
+
+# -----------------------
+# 6. LSTM Baseline
+# -----------------------
+class LSTMModel(nn.Module):
+    def __init__(self, n_features, hidden=64):
+        super().__init__()
+        self.lstm = nn.LSTM(n_features, hidden, batch_first=True)
+        self.fc = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        _, (h, _) = self.lstm(x)
+        return self.fc(h[-1])
+
+# -----------------------
+# 7. Training Function
+# -----------------------
+def train_model(model, epochs=15):
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.MSELoss()
+    model.to(DEVICE)
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+
+            optimizer.zero_grad()
+            preds = model(xb).squeeze()
+            loss = loss_fn(preds, yb.squeeze())
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(train_loader):.4f}")
+
+# -----------------------
+# 8. Evaluation Metrics
+# -----------------------
+def evaluate(model):
+    model.eval()
+    preds, actuals = [], []
+
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb = xb.to(DEVICE)
+            pred = model(xb).cpu().numpy()
+            preds.extend(pred.flatten())
+            actuals.extend(yb.numpy().flatten())
+
+    rmse = np.sqrt(mean_squared_error(actuals, preds))
+    mae = mean_absolute_error(actuals, preds)
+    mape = np.mean(np.abs((actuals - preds) / actuals)) * 100
+
+    return rmse, mae, mape
+
+# -----------------------
+# 9. Train Models
+# -----------------------
+transformer = TimeSeriesTransformer(n_features=5)
+lstm = LSTMModel(n_features=5)
+
+print("\nTraining Transformer...")
+train_model(transformer)
+
+print("\nTraining LSTM...")
+train_model(lstm)
+
+# -----------------------
+# 10. Evaluation
+# -----------------------
+tr_rmse, tr_mae, tr_mape = evaluate(transformer)
+ls_rmse, ls_mae, ls_mape = evaluate(lstm)
+
+print("\nFinal Results")
+print(f"Transformer -> RMSE: {tr_rmse:.4f}, MAE: {tr_mae:.4f}, MAPE: {tr_mape:.2f}%")
+print(f"LSTM        -> RMSE: {ls_rmse:.4f}, MAE: {ls_mae:.4f}, MAPE: {ls_mape:.2f}%")
+
+# -----------------------
+# 11. Attention Visualization
+# -----------------------
+def visualize_attention(model, sample):
+    model.eval()
+    with torch.no_grad():
+        x = model.embedding(sample)
+        x = model.positional(x)
+        layer = model.encoder.layers[0]
+        _, attn = layer.self_attn(x, x, x, need_weights=True)
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(attn[0].cpu(), cmap="viridis")
+    plt.colorbar()
+    plt.title("Attention Weights")
+    plt.xlabel("Past Time Steps")
+    plt.ylabel("Past Time Steps")
+    plt.show()
+
+
+sample = torch.tensor(X_test[:1], dtype=torch.float32).to(DEVICE)
+visualize_attention(transformer, sample)
